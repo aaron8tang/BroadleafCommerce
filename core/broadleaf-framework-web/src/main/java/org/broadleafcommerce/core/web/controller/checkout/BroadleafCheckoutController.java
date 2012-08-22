@@ -8,13 +8,18 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import org.apache.commons.lang.BooleanUtils;
+import org.broadleafcommerce.common.exception.ServiceException;
 import org.broadleafcommerce.common.time.SystemTime;
+import org.broadleafcommerce.common.vendor.service.exception.FulfillmentPriceException;
 import org.broadleafcommerce.core.checkout.service.exception.CheckoutException;
 import org.broadleafcommerce.core.checkout.service.workflow.CheckoutResponse;
 import org.broadleafcommerce.core.order.domain.FulfillmentGroup;
@@ -27,7 +32,9 @@ import org.broadleafcommerce.core.payment.domain.PaymentInfo;
 import org.broadleafcommerce.core.payment.domain.Referenced;
 import org.broadleafcommerce.core.payment.service.type.PaymentInfoType;
 import org.broadleafcommerce.core.pricing.service.exception.PricingException;
+import org.broadleafcommerce.core.pricing.service.fulfillment.provider.FulfillmentEstimationResponse;
 import org.broadleafcommerce.core.web.checkout.model.BillingInfoForm;
+import org.broadleafcommerce.core.web.checkout.model.MultiShipInstructionForm;
 import org.broadleafcommerce.core.web.checkout.model.OrderMultishipOptionForm;
 import org.broadleafcommerce.core.web.checkout.model.ShippingInfoForm;
 import org.broadleafcommerce.core.web.order.CartState;
@@ -42,7 +49,6 @@ import org.joda.time.DateTime;
 import org.springframework.ui.Model;
 import org.springframework.validation.BindingResult;
 import org.springframework.web.bind.ServletRequestDataBinder;
-
 
 /**
  * In charge of performing the various checkout operations
@@ -74,8 +80,20 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
     	if (!(cart instanceof NullOrderImpl)) {
 			model.addAttribute("orderMultishipOptions", orderMultishipOptionService.getOrGenerateOrderMultishipOptions(cart));
     	}
-	    model.addAttribute("fulfillmentOptions", fulfillmentOptionService.readAllFulfillmentOptions());
-        model.addAttribute("validShipping", hasValidShippingAddresses(cart));
+    	
+		String editShipping = request.getParameter("edit-shipping");
+		
+		boolean hasValidShipping; 
+		
+		if (BooleanUtils.toBoolean(editShipping)) {
+			hasValidShipping = false;
+		} else {
+			hasValidShipping = hasValidShippingAddresses(cart);
+		}
+        model.addAttribute("validShipping", hasValidShipping);
+
+        putFulfillmentOptionsAndEstimationOnModel(model);
+        
     	model.addAttribute("states", stateService.findStates());
         model.addAttribute("countries", countryService.findCountries());
         model.addAttribute("expirationMonths", populateExpirationMonths());
@@ -112,18 +130,28 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
      * @param model
      * @param shippingForm
      * @return the return path
+     * @throws ServiceException 
      */
 	public String saveSingleShip(HttpServletRequest request, HttpServletResponse response, Model model,
-			ShippingInfoForm shippingForm, BindingResult result) throws PricingException {
+			ShippingInfoForm shippingForm, BindingResult result) throws PricingException, ServiceException {
+		exploitProtectionService.compareToken(shippingForm.getCsrfToken());
         Order cart = CartState.getCart();
 
         shippingInfoFormValidator.validate(shippingForm, result);
         if (result.hasErrors()) {
-            return checkout(request, response, model);
+            putFulfillmentOptionsAndEstimationOnModel(model);
+        	model.addAttribute("states", stateService.findStates());
+            model.addAttribute("countries", countryService.findCountries());
+            model.addAttribute("expirationMonths", populateExpirationMonths());
+            model.addAttribute("expirationYears", populateExpirationYears());
+            model.addAttribute("validShipping", false);
+        	return getCheckoutView();
         }
 
         FulfillmentGroup fulfillmentGroup = cart.getFulfillmentGroups().get(0);
         fulfillmentGroup.setAddress(shippingForm.getAddress());
+        fulfillmentGroup.setPersonalMessage(shippingForm.getPersonalMessage());
+        fulfillmentGroup.setDeliveryInstruction(shippingForm.getDeliveryMessage());
         FulfillmentOption fulfillmentOption = fulfillmentOptionService.readFulfillmentOptionById(shippingForm.getFulfillmentOptionId());
         fulfillmentGroup.setFulfillmentOption(fulfillmentOption);
 
@@ -172,9 +200,11 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
 	 * @param orderMultishipOptionForm
 	 * @return a redirect to the checkout page
 	 * @throws PricingException 
+	 * @throws ServiceException 
 	 */
     public String saveMultiship(HttpServletRequest request, HttpServletResponse response, Model model,
-    		OrderMultishipOptionForm orderMultishipOptionForm, BindingResult result) throws PricingException {
+    		OrderMultishipOptionForm orderMultishipOptionForm, BindingResult result) throws PricingException, ServiceException {
+		exploitProtectionService.compareToken(orderMultishipOptionForm.getCsrfToken());
     	Order cart = CartState.getCart();
     	orderMultishipOptionService.saveOrderMultishipOptions(cart, orderMultishipOptionForm.getOptions());
     	cart = fulfillmentGroupService.matchFulfillmentGroupsToMultishipOptions(cart, true);
@@ -205,9 +235,11 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
      * @param model
      * @param addressForm
      * @return the return path to the multiship page
+     * @throws ServiceException 
      */
     public String saveMultishipAddAddress(HttpServletRequest request, HttpServletResponse response, Model model,
-    		 ShippingInfoForm addressForm, BindingResult result) {
+    		 ShippingInfoForm addressForm, BindingResult result) throws ServiceException {
+		exploitProtectionService.compareToken(addressForm.getCsrfToken());
         multishipAddAddressFormValidator.validate(addressForm, result);
         if (result.hasErrors()) {
             return showMultishipAddAddress(request, response, model);
@@ -224,6 +256,24 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
     	//append current time to redirect to fix a problem with ajax caching in IE
     	return getMultishipAddAddressSuccessView() + "?_=" + System.currentTimeMillis();
     }
+
+    public String saveMultiShipInstruction(HttpServletRequest request, HttpServletResponse response, Model model,
+    		MultiShipInstructionForm instructionForm) throws ServiceException, PricingException {
+    	Order cart = CartState.getCart();
+    	FulfillmentGroup fulfillmentGroup = null;
+    	
+    	for (FulfillmentGroup tempFulfillmentGroup : cart.getFulfillmentGroups()) {
+    		if (tempFulfillmentGroup.getId() == instructionForm.getFulfillmentGroupId()) {
+    			fulfillmentGroup = tempFulfillmentGroup;
+    		}
+    	}
+    	fulfillmentGroup.setPersonalMessage(instructionForm.getPersonalMessage());
+    	fulfillmentGroup.setDeliveryInstruction(instructionForm.getDeliveryMessage());
+    	fulfillmentGroupService.save(fulfillmentGroup);
+    	
+   	//append current time to redirect to fix a problem with ajax caching in IE
+   	return getCheckoutPageRedirect()+ "?_=" + System.currentTimeMillis();
+   }
 
     /**
      * Processes the request to complete checkout using a Credit Card
@@ -245,9 +295,11 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
      * @param model
      * @param billingForm
      * @return the return path
+     * @throws ServiceException 
      */
     public String completeSecureCreditCardCheckout(HttpServletRequest request, HttpServletResponse response, Model model,
-            BillingInfoForm billingForm, BindingResult result) throws CheckoutException, PricingException {
+            BillingInfoForm billingForm, BindingResult result) throws CheckoutException, PricingException, ServiceException {
+		exploitProtectionService.compareToken(billingForm.getCsrfToken());
 
         Order cart = CartState.getCart();
         if (cart != null) {
@@ -367,6 +419,27 @@ public class BroadleafCheckoutController extends AbstractCheckoutController {
         return true;
     }
 
+    /**
+     * A helper method to retrieve all fulfillment options for the cart
+     */
+    protected void putFulfillmentOptionsAndEstimationOnModel(Model model) {
+        List<FulfillmentOption> fulfillmentOptions = fulfillmentOptionService.readAllFulfillmentOptions();
+        Order cart = CartState.getCart();
+        		
+        if (hasValidShippingAddresses(cart)) {
+            Set<FulfillmentOption> options = new HashSet<FulfillmentOption>();
+            options.addAll(fulfillmentOptions);
+            FulfillmentEstimationResponse estimateResponse = null;
+            try {
+                estimateResponse = fulfillmentPricingService.estimateCostForFulfillmentGroup(cart.getFulfillmentGroups().get(0), options);
+            } catch (FulfillmentPriceException e) {
+                
+            }
+            model.addAttribute("estimateResponse", estimateResponse);
+        }
+        model.addAttribute("fulfillmentOptions", fulfillmentOptions);
+    }
+    
     /**
      * A helper method used to construct a list of Credit Card Expiration Months
      * Useful for expiration dropdown menus.
